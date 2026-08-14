@@ -1087,6 +1087,7 @@ change_config() {
             ;;
         4)
             purple "端口跳跃需确保跳跃区间的端口没有被占用\n"
+            purple "如果是云服务器(阿里云/腾讯云/AWS/搬瓦工等)，还需去控制台的安全组/防火墙里额外放行这段UDP端口区间，否则本机防火墙放行了也连不通\n"
             reading "请输入跳跃起始端口 (回车跳过将使用随机端口): " min_port
             [ -z "$min_port" ] && min_port=$(shuf -i 50000-65000 -n 1)
             yellow "你的起始端口为：$min_port"
@@ -1094,6 +1095,18 @@ change_config() {
             [ -z "$max_port" ] && max_port=$(($min_port + 100))
             yellow "你的结束端口为：$max_port\n"
             listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
+
+            # 显式放行跳跃端口区间（原脚本只加了iptables的DNAT转发规则，
+            # 若系统启用了ufw或firewalld，它们各自维护独立的入站过滤规则，
+            # 不显式放行这个区间的话，多端口跳跃流量会被挡在ufw/firewalld这一层）
+            if command_exists ufw; then
+                ufw allow in ${min_port}:${max_port}/udp > /dev/null 2>&1
+            fi
+            if command_exists firewall-cmd && systemctl is-active firewalld > /dev/null 2>&1; then
+                firewall-cmd --permanent --add-port=${min_port}-${max_port}/udp > /dev/null 2>&1
+                firewall-cmd --reload > /dev/null 2>&1
+            fi
+
             iptables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             command -v ip6tables &> /dev/null && ip6tables -t nat -A PREROUTING -p udp --dport $min_port:$max_port -j DNAT --to-destination :$listen_port > /dev/null
             if command_exists rc-service 2>/dev/null; then
