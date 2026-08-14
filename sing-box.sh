@@ -293,28 +293,32 @@ install_singbox() {
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
         else
             ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --server letsencrypt
-            acme_result=$?
 
-            # 无论申请成功与否，先把刚才临时停掉的服务恢复启动
+            # 无论--issue命令的返回码是什么(已签发过会跳过续期并返回非0，但本地证书其实是有效的)，
+            # 都统一尝试安装证书，最后用生成的证书文件本身判断成功与否，而不是看issue的退出码
+            ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
+                --key-file "${work_dir}/private.key" \
+                --fullchain-file "${work_dir}/cert.pem" \
+                --reloadcmd "systemctl restart sing-box > /dev/null 2>&1 || rc-service sing-box restart > /dev/null 2>&1" \
+                > /dev/null 2>&1
+
+            # 恢复刚才临时停掉的服务
             for svc in "${stopped_services[@]}"; do
                 yellow "正在恢复 ${svc} 服务..."
                 if command_exists systemctl; then systemctl start "$svc" > /dev/null 2>&1
                 elif command_exists rc-service; then rc-service "$svc" start > /dev/null 2>&1; fi
             done
 
-            if [ $acme_result -ne 0 ]; then
+            if [ -s "${work_dir}/cert.pem" ] && [ -s "${work_dir}/private.key" ] && \
+               openssl x509 -checkend 0 -noout -in "${work_dir}/cert.pem" > /dev/null 2>&1; then
+                fingerprint=""
+                echo "$DOMAIN" > "${work_dir}/domain.txt"
+                green "证书申请成功: ${work_dir}/cert.pem\n"
+            else
                 red "证书申请失败，请检查域名解析是否正确指向本机IP，将退回自签证书\n"
                 openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
                 openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
                 fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
-            else
-                ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
-                    --key-file "${work_dir}/private.key" \
-                    --fullchain-file "${work_dir}/cert.pem" \
-                    --reloadcmd "systemctl restart sing-box > /dev/null 2>&1 || rc-service sing-box restart > /dev/null 2>&1"
-                fingerprint=""
-                echo "$DOMAIN" > "${work_dir}/domain.txt"
-                green "证书申请成功: ${work_dir}/cert.pem\n"
             fi
         fi
     else
