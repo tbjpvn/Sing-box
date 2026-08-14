@@ -263,15 +263,46 @@ install_singbox() {
         curl https://get.acme.sh | sh -s email=admin@${DOMAIN} > /dev/null 2>&1
         export PATH="$HOME/.acme.sh:$PATH"
 
-        if lsof -i:80 > /dev/null 2>&1; then
-            red "80端口被占用，无法用standalone模式申请证书，将退回自签证书\n"
+        # 临时释放80端口：先尝试优雅停止常见的web服务，申请完证书后再恢复
+        stopped_services=()
+        for svc in nginx apache2 httpd caddy lighttpd; do
+            if command_exists systemctl && systemctl is-active "$svc" &>/dev/null; then
+                yellow "检测到 ${svc} 占用80端口，临时停止..."
+                systemctl stop "$svc" > /dev/null 2>&1
+                stopped_services+=("$svc")
+            elif command_exists rc-service && rc-service "$svc" status 2>/dev/null | grep -q started; then
+                yellow "检测到 ${svc} 占用80端口，临时停止..."
+                rc-service "$svc" stop > /dev/null 2>&1
+                stopped_services+=("$svc")
+            fi
+        done
+
+        # 如果还有未知进程占用80端口，强制临时结束（不在已知服务列表里，无法自动恢复，需自行手动重启）
+        if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
+            yellow "仍检测到有进程占用80端口，尝试临时终止..."
+            for pid in $(lsof -i:80 -sTCP:LISTEN -t 2>/dev/null); do
+                kill -9 "$pid" > /dev/null 2>&1
+            done
+            sleep 1
+        fi
+
+        if lsof -i:80 -sTCP:LISTEN -t > /dev/null 2>&1; then
+            red "80端口仍被占用，无法申请证书，将退回自签证书\n"
             openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
             openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
             fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
         else
             ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --server letsencrypt
+            acme_result=$?
 
-            if [ $? -ne 0 ]; then
+            # 无论申请成功与否，先把刚才临时停掉的服务恢复启动
+            for svc in "${stopped_services[@]}"; do
+                yellow "正在恢复 ${svc} 服务..."
+                if command_exists systemctl; then systemctl start "$svc" > /dev/null 2>&1
+                elif command_exists rc-service; then rc-service "$svc" start > /dev/null 2>&1; fi
+            done
+
+            if [ $acme_result -ne 0 ]; then
                 red "证书申请失败，请检查域名解析是否正确指向本机IP，将退回自签证书\n"
                 openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
                 openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
