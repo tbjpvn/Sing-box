@@ -245,9 +245,9 @@ install_singbox() {
     # rm -rf "${work_dir}/${server_name}.tar.gz" "${work_dir}/sing-box-${latest_version}-linux-${ARCH}"
     chown root:root ${work_dir} && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
 
-    nginx_port=$(($vless_port + 1))
-    tuic_port=$(($vless_port + 2))
-    hy2_port=$(($vless_port + 3))
+    nginx_port=${NGINX_PORT:-$(($vless_port + 1))}
+    tuic_port=${TUIC_PORT:-$(($vless_port + 2))}
+    hy2_port=${HY2_PORT:-$(($vless_port + 3))}
     uuid=$(cat /proc/sys/kernel/random/uuid)
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     output=$(/etc/sing-box/sing-box generate reality-keypair)
@@ -890,6 +890,25 @@ auto_install() {
     get_info
     add_nginx_conf
     create_shortcut
+
+    # 端口监听自检：确认sing-box真的绑定成功了这几个端口，NAT机常见的"随机端口顺延到未转发端口"问题能第一时间发现
+    yellow "\n正在检测端口监听状态...\n"
+    port_check_failed=0
+    if ! ss -lnt 2>/dev/null | grep -qE ":${vless_port}([[:space:]]|$)"; then
+        red "警告: vless 端口 ${vless_port}/tcp 未检测到监听\n"; port_check_failed=1
+    fi
+    if ! ss -lnu 2>/dev/null | grep -qE ":${hy2_port}([[:space:]]|$)"; then
+        red "警告: hysteria2 端口 ${hy2_port}/udp 未检测到监听\n"; port_check_failed=1
+    fi
+    if ! ss -lnu 2>/dev/null | grep -qE ":${tuic_port}([[:space:]]|$)"; then
+        red "警告: tuic 端口 ${tuic_port}/udp 未检测到监听\n"; port_check_failed=1
+    fi
+    if [ "$port_check_failed" -eq 1 ]; then
+        red "以上端口本机未监听，服务可能没启动成功，请用 'journalctl -u sing-box -n 50' 或 'sing-box run -C /etc/sing-box/conf' 查看具体报错\n"
+    else
+        green "本机端口均监听正常。如果外部仍连不上，请检查该端口是否在你VPS服务商(尤其是NAT机)后台被正确转发/放行\n"
+    fi
+
     green "\nsing-box 安装完成\n"
 }
 
