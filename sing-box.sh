@@ -1115,6 +1115,11 @@ change_config() {
             yellow "你的结束端口为：$max_port\n"
             listen_port=$(jq -r '.inbounds[] | select(.type == "hysteria2").listen_port' "${conf_dir}/inbounds.json")
 
+            # 先清空之前残留的端口跳跃DNAT规则(每次"添加"都是新增规则、从不清理旧的，
+            # 反复设置几次或hy2端口变过之后会堆积多条失效规则，导致部分跳跃端口连不通)
+            iptables -t nat -F PREROUTING > /dev/null 2>&1
+            command -v ip6tables &> /dev/null && ip6tables -t nat -F PREROUTING > /dev/null 2>&1
+
             # 显式放行跳跃端口区间（原脚本只加了iptables的DNAT转发规则，
             # 若系统启用了ufw或firewalld，它们各自维护独立的入站过滤规则，
             # 不显式放行这个区间的话，多端口跳跃流量会被挡在ufw/firewalld这一层）
