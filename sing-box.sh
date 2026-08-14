@@ -4,6 +4,7 @@
 # 老王sing-box四合一安装脚本
 # vless-version-reality|vmess-ws-tls(tunnel)|hysteria2|tuic5|[可额外添加Anytls，socks5，ss2022等协议] 
 # 最后更新时间: 2026.6.7[添加hy2证书, 添加ipv4和ipv6切换]
+# 个人修改: 支持DOMAIN变量，用acme.sh申请Let's Encrypt真实域名证书替代自签证书(hy2/tuic)
 # =========================
 
 export LANG=en_US.UTF-8
@@ -30,6 +31,9 @@ export vless_port=${PORT:-$(shuf -i 1000-65000 -n 1)}
 export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export ARGO_PORT=${ARGO_PORT:-'8001'} 
 export CFPORT=${CFPORT:-'443'} 
+export DOMAIN=${DOMAIN:-''}
+# 已安装过的机器，若本次运行未显式传DOMAIN，则读取上次安装记录的域名
+[ -z "$DOMAIN" ] && [ -f "${work_dir}/domain.txt" ] && DOMAIN=$(cat "${work_dir}/domain.txt")
 
 # 检查是否为root下运行
 [[ $EUID -ne 0 ]] && red "请在root用户下运行脚本，可输入 sudo -i 回车切换到root用户" && exit 1
@@ -252,10 +256,41 @@ install_singbox() {
 
     allow_port $vless_port/tcp $nginx_port/tcp $tuic_port/udp $hy2_port/udp > /dev/null 2>&1
 
-    openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
-    openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
-    
-    fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+    if [ -n "$DOMAIN" ]; then
+        yellow "\n检测到自定义域名 ${DOMAIN}，正在申请Let's Encrypt证书...\n"
+        manage_packages install socat curl
+
+        curl https://get.acme.sh | sh -s email=admin@${DOMAIN} > /dev/null 2>&1
+        export PATH="$HOME/.acme.sh:$PATH"
+
+        if lsof -i:80 > /dev/null 2>&1; then
+            red "80端口被占用，无法用standalone模式申请证书，将退回自签证书\n"
+            openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+            openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+        else
+            ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone -k ec-256 --server letsencrypt
+
+            if [ $? -ne 0 ]; then
+                red "证书申请失败，请检查域名解析是否正确指向本机IP，将退回自签证书\n"
+                openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+                openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+                fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+            else
+                ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
+                    --key-file "${work_dir}/private.key" \
+                    --fullchain-file "${work_dir}/cert.pem" \
+                    --reloadcmd "systemctl restart sing-box > /dev/null 2>&1 || rc-service sing-box restart > /dev/null 2>&1"
+                fingerprint=""
+                echo "$DOMAIN" > "${work_dir}/domain.txt"
+                green "证书申请成功: ${work_dir}/cert.pem\n"
+            fi
+        fi
+    else
+        openssl ecparam -genkey -name prime256v1 -out "${work_dir}/private.key"
+        openssl req -new -x509 -days 3650 -key "${work_dir}/private.key" -out "${work_dir}/cert.pem" -subj "/CN=bing.com"
+        fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+    fi
     
     dns_strategy=$(ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1 && echo "prefer_ipv4" || \
         (ping -c 1 -W 3 2001:4860:4860::8888 >/dev/null 2>&1 && echo "prefer_ipv6" || echo "prefer_ipv4"))
@@ -351,7 +386,7 @@ EOF
         }
       ],
       "ignore_client_bandwidth": false,
-      "masquerade": "https://bing.com",
+      "masquerade": "https://${DOMAIN:-bing.com}",
       "tls": {
         "enabled": true,
         "alpn": ["h3"],
@@ -556,14 +591,24 @@ get_info() {
         extra_lines=$(grep -vE '^(vless://|vmess://|hysteria2://|tuic://)' "${client_dir}" || true)
     fi
 
+    if [ -n "$DOMAIN" ]; then
+        tls_sni="$DOMAIN"
+        tls_insecure="0"
+        hy2_pin=""
+    else
+        tls_sni="www.bing.com"
+        tls_insecure="1"
+        hy2_pin="&pinSHA256=${fingerprint}"
+    fi
+
     cat > ${work_dir}/url.txt << EOF
 vless://${uuid}@${server_ip}:${vless_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk=${public_key}&type=tcp&headerType=none#${isp}
 
 vmess://$(echo "$VMESS" | base64 -w0)
 
-hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none#${isp}
+hysteria2://${uuid}@${server_ip}:${hy2_port}/?sni=${tls_sni}&insecure=${tls_insecure}${hy2_pin}&alpn=h3&obfs=none#${isp}
 
-tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1#${isp}
+tuic://${uuid}:${uuid}@${server_ip}:${tuic_port}?sni=${tls_sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=${tls_insecure}#${isp}
 EOF
 
     if [ -n "$extra_lines" ]; then
@@ -768,7 +813,7 @@ uninstall_singbox() {
 create_shortcut() {
     cat > "$work_dir/sb.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) $1
+bash <(curl -Ls https://raw.githubusercontent.com/tbjpvn/Sing-box/main/sing-box.sh) $1
 EOF
     chmod +x "$work_dir/sb.sh"
     ln -sf "$work_dir/sb.sh" /usr/bin/sb
@@ -1039,13 +1084,18 @@ IEOF
             fi
             restart_singbox
             ip=$(get_realip)
-            fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
             uuid=$(sed -n 's/.*hysteria2:\/\/\([^@]*\)@.*/\1/p' $client_dir)
             line_number=$(grep -n 'hysteria2://' $client_dir | cut -d':' -f1)
             isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | \
                 awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "$hostname")
+            if [ -n "$DOMAIN" ]; then
+                hop_sni="$DOMAIN"; hop_insecure="0"; hop_pin=""
+            else
+                fingerprint=$(openssl x509 -noout -fingerprint -sha256 -in "${work_dir}/cert.pem" | cut -d'=' -f2 | sed 's/:/%3A/g')
+                hop_sni="www.bing.com"; hop_insecure="1"; hop_pin="&pinSHA256=${fingerprint}"
+            fi
             sed -i.bak "/hysteria2:/d" $client_dir
-            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&pinSHA256=${fingerprint}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
+            sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=${hop_sni}&insecure=${hop_insecure}${hop_pin}&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
             base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nhysteria2端口跳跃已开启：${purple}$min_port-$max_port${re}\n"
@@ -2237,7 +2287,7 @@ menu() {
     clear; echo ""
     green "Telegram群组: ${purple}https://t.me/eooceu${re}"
     green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-    green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
+    green "Github地址: ${purple}https://github.com/tbjpvn/Sing-box${re}\n"
     purple "=== 老王sing-box四合一安装脚本 ===\n"
     purple "---Argo 状态: ${argo_status}"
     purple "--Nginx 状态: ${nginx_status}"
